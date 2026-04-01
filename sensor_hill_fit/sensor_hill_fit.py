@@ -1,13 +1,13 @@
 """
-传感器 Hill 方程拟合分析工具  v1.4.1
+传感器 Hill 方程拟合分析工具  v1.5
 =======================================
-核心分析逻辑（v1.3 重构，v1.4 新增加载参数模式）：
+核心分析逻辑（v1.3 重构，v1.4 新增加载参数模式，v1.5 改为单传感器均值）：
   1. 每个 CSV 文件包含同一次实验的 4 个传感器列
-  2. 对每行按压力分箱，将 4 个传感器值求和 → 得到该次实验的"求和曲线"
-  3. 将多个文件（多次实验）的求和曲线按压力分箱取均值 → 得到"平均曲线"
+  2. 对每行按压力分箱，将 4 个传感器值求和后除以传感器数量 → 得到该次实验的"单传感器均值曲线"
+  3. 将多个文件（多次实验）的均值曲线按压力分箱取均值 → 得到"总平均曲线"
   4. 对平均曲线进行 Hill 方程 & 双曲线拟合  [拟合模式]
      OR 直接使用已有参数，不重新拟合       [加载参数模式 v1.4]
-  5. 将拟合曲线回代到每次实验的求和曲线，计算残差
+  5. 将拟合曲线回代到每次实验的均值曲线，计算残差
 
 v1.4 新增功能：
   - 左侧面板新增"加载拟合参数"区域
@@ -185,16 +185,19 @@ def parse_csv(content: str, filename: str = "") -> dict:
         rows.append({"pressure": pressure, "sensor_values": vals})
     return {"filename": filename, "sensor_ids": sensor_ids, "rows": rows}
 
-# ─── 核心：求和曲线 ────────────────────────────────────────────────────────────
-
+# ─── 核心：单传感器均值曲线（求和后除以传感器数量）────────────────────────────────
 def compute_sum_curve(parsed: dict, p_min: float, p_max: float,
                       val_thresh: float) -> list:
+    """对每行的传感器值求和后除以传感器数量，得到单传感器平均值曲线。
+    返回列表中的 sum_value 字段实际为单传感器均值（保持字段名兼容性）。
+    """
+    n_sensors = max(len(parsed["sensor_ids"]), 1)  # 防止除以零
     result = []
     for row in parsed["rows"]:
         p = row["pressure"]
         if p <= p_min or p > p_max:
             continue
-        s = sum(row["sensor_values"])
+        s = sum(row["sensor_values"]) / n_sensors  # 除以传感器数量，得到单传感器均值
         if s <= val_thresh:
             continue
         result.append({"pressure": p, "sum_value": s})
@@ -311,9 +314,9 @@ def back_project_to_sum_curves(
 # ─── 主应用 ────────────────────────────────────────────────────────────────────
 
 class SensorAnalyzerApp(ctk.CTk):
-    """传感器 Hill 方程拟合分析工具 v1.4"""
+    """传感器 Hill 方程拟合分析工具 v1.5"""
 
-    VERSION = "v1.4.1"
+    VERSION = "v1.5"
 
     def __init__(self):
         super().__init__()
@@ -342,7 +345,7 @@ class SensorAnalyzerApp(ctk.CTk):
         ).pack(side="left", padx=20, pady=10)
         ctk.CTkLabel(
             header,
-            text="上传多次实验 CSV → 4传感器求和 → 均值曲线 → Hill 拟合 → 残差分析",
+            text="上传多次实验 CSV → 4传感器求和÷数量 → 单传感器均值曲线 → Hill 拟合 → 残差分析",
             font=("Microsoft YaHei", 11),
             text_color="#888",
         ).pack(side="left", padx=10)
@@ -382,7 +385,7 @@ class SensorAnalyzerApp(ctk.CTk):
         ctk.CTkLabel(
             scroll,
             text="每个 CSV 文件对应一次实验，包含同一组传感器的多列数据。\n"
-                 "工具将对每行的所有传感器列求和，得到该次实验的求和曲线。",
+                 "工具将对每行的所有传感器列求和后除以传感器数量，得到单传感器均值曲线。",
             font=FONT_SMALL, text_color="#888", wraplength=300,
         ).pack(anchor="w", pady=(0, 8))
 
@@ -400,10 +403,10 @@ class SensorAnalyzerApp(ctk.CTk):
         ctk.CTkEntry(prow, textvariable=self.p_max_var, width=80,
                      placeholder_text="最大").pack(side="left", padx=(4, 0))
 
-        self._label(scroll, "求和值最小阈值（过滤静息期）")
+        self._label(scroll, "单传感器均值最小阈值（过滤静息期）")
         self.val_threshold_var = tk.DoubleVar(value=0.0)
         ctk.CTkEntry(scroll, textvariable=self.val_threshold_var,
-                     placeholder_text="默认 0，求和值大于此值才参与分析").pack(fill="x", pady=(0, 6))
+                     placeholder_text="默认 0，单传感器均值大于此值才参与分析").pack(fill="x", pady=(0, 6))
 
         self._label(scroll, "平滑窗口大小（均值曲线）")
         self.smooth_var = tk.IntVar(value=5)
