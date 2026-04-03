@@ -1,5 +1,5 @@
 """
-传感器 Hill 方程拟合分析工具  v1.5
+传感器 Hill 方程拟合分析工具  v1.6
 =======================================
 核心分析逻辑（v1.3 重构，v1.4 新增加载参数模式，v1.5 改为单传感器均值）：
   1. 每个 CSV 文件包含同一次实验的 4 个传感器列
@@ -314,9 +314,9 @@ def back_project_to_sum_curves(
 # ─── 主应用 ────────────────────────────────────────────────────────────────────
 
 class SensorAnalyzerApp(ctk.CTk):
-    """传感器 Hill 方程拟合分析工具 v1.5"""
+    """传感器 Hill 方程拟合分析工具 v1.6"""
 
-    VERSION = "v1.5"
+    VERSION = "v1.6"
 
     def __init__(self):
         super().__init__()
@@ -543,6 +543,50 @@ class SensorAnalyzerApp(ctk.CTk):
         ctk.CTkButton(exp_row, text="导出 JSON", command=lambda: self._export("json"),
                       width=110, height=30).pack(side="left")
 
+        # ════════════════════════════════════════════
+        # ── ADC → 压力反推区域（v1.6 新增）──
+        # ════════════════════════════════════════════
+        self._section(scroll, "🔄  ADC → 压力反推")
+        ctk.CTkLabel(
+            scroll,
+            text="已知 ADC 均值，用 Hill 反向公式推算对应压力。\n"
+                 "x = b · (y / (a − y))^(1/n)",
+            font=FONT_SMALL, text_color="#80DEEA", wraplength=300,
+        ).pack(anchor="w", pady=(0, 6))
+        # ADC 输入框
+        self._label(scroll, "ADC 均值（可输入多个，用逗号或换行分隔）")
+        self.inv_adc_entry = ctk.CTkTextbox(
+            scroll, height=60, font=FONT_MONO,
+            fg_color="#0f3460", text_color="#e0e0e0",
+        )
+        self.inv_adc_entry.pack(fill="x", pady=(0, 4))
+        # 参数来源选择
+        self._label(scroll, "使用参数来源")
+        self.inv_param_source = ctk.StringVar(value="fit")
+        src_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        src_row.pack(fill="x", pady=(0, 6))
+        ctk.CTkRadioButton(
+            src_row, text="拟合结果", variable=self.inv_param_source,
+            value="fit", font=FONT_SMALL,
+        ).pack(side="left", padx=(0, 12))
+        ctk.CTkRadioButton(
+            src_row, text="加载参数", variable=self.inv_param_source,
+            value="loaded", font=FONT_SMALL,
+        ).pack(side="left")
+        # 执行按鈕
+        ctk.CTkButton(
+            scroll, text="🔄  计算反推压力",
+            command=self._run_inverse,
+            height=36, font=("Microsoft YaHei", 11, "bold"),
+            fg_color="#006064", hover_color="#00838f",
+        ).pack(fill="x", pady=(0, 4))
+        # 结果展示框
+        self.inv_result_text = tk.Text(
+            scroll, height=8, bg="#0f3460", fg="#80DEEA",
+            font=FONT_MONO, relief="flat", bd=0,
+            state="disabled", wrap="none",
+        )
+        self.inv_result_text.pack(fill="x", pady=(0, 8))
         # ── 状态栏 ──
         self.status_var = tk.StringVar(value="就绪 — 请添加 CSV 文件")
         ctk.CTkLabel(scroll, textvariable=self.status_var,
@@ -561,12 +605,13 @@ class SensorAnalyzerApp(ctk.CTk):
         self.tab_fit    = self.tab_view.add("拟合曲线")
         self.tab_resid  = self.tab_view.add("残差分析")
         self.tab_each   = self.tab_view.add("各次实验对比")
-        self.tab_loaded = self.tab_view.add("加载参数残差")   # v1.4 新增
-
-        self.fig_fit,    self.canvas_fit    = self._make_canvas(self.tab_fit)
-        self.fig_resid,  self.canvas_resid  = self._make_canvas(self.tab_resid)
-        self.fig_each,   self.canvas_each   = self._make_canvas(self.tab_each)
-        self.fig_loaded, self.canvas_loaded = self._make_canvas(self.tab_loaded)
+        self.tab_loaded  = self.tab_view.add("加载参数残差")   # v1.4 新增
+        self.tab_inverse = self.tab_view.add("反向推算")           # v1.6 新增
+        self.fig_fit,     self.canvas_fit     = self._make_canvas(self.tab_fit)
+        self.fig_resid,   self.canvas_resid   = self._make_canvas(self.tab_resid)
+        self.fig_each,    self.canvas_each    = self._make_canvas(self.tab_each)
+        self.fig_loaded,  self.canvas_loaded  = self._make_canvas(self.tab_loaded)
+        self.fig_inverse, self.canvas_inverse = self._make_canvas(self.tab_inverse)
 
     def _make_canvas(self, parent):
         fig = Figure(figsize=(10, 7), dpi=96, facecolor="#0d1b2a")
@@ -1312,8 +1357,139 @@ class SensorAnalyzerApp(ctk.CTk):
                 json.dump(export, f, ensure_ascii=False, indent=2)
             messagebox.showinfo("导出成功", f"JSON 已保存至：\n{path}")
 
-    # ── 工具 ───────────────────────────────────────────────────────────────────
+    # ── ADC → 压力反推 ─────────────────────────────────────────────────────────
 
+    def _run_inverse(self):
+        """已知 ADC 均值，用 Hill 反向公式计算压力，并绘制反向曲线图。"""
+        # 1. 获取参数
+        source = self.inv_param_source.get()
+        a = b = n = None
+        if source == "fit" and self.analysis_result:
+            r = self.analysis_result
+            a, b, n = r["hill"]["a"], r["hill"]["b"], r["hill"]["n"]
+        elif source == "loaded" and self.loaded_param_result:
+            lp = self.loaded_param_result
+            a, b, n = lp["hill_a"], lp["hill_b"], lp["hill_n"]
+        else:
+            # 尝试从另一种来源获取
+            if self.analysis_result:
+                r = self.analysis_result
+                a, b, n = r["hill"]["a"], r["hill"]["b"], r["hill"]["n"]
+            elif self.loaded_param_result:
+                lp = self.loaded_param_result
+                a, b, n = lp["hill_a"], lp["hill_b"], lp["hill_n"]
+            else:
+                messagebox.showerror("无参数",
+                    "请先运行拟合分析或加载参数，才能使用反推功能。")
+                return
+
+        # 2. 解析 ADC 输入
+        raw = self.inv_adc_entry.get("1.0", "end").strip()
+        if not raw:
+            messagebox.showwarning("输入为空", "请输入至少一个 ADC 均值。")
+            return
+        import re
+        tokens = re.split(r"[,\s\n]+", raw)
+        adc_values = []
+        for t in tokens:
+            t = t.strip()
+            if not t:
+                continue
+            try:
+                adc_values.append(float(t))
+            except ValueError:
+                messagebox.showerror("格式错误", f"无法解析数値：'{t}'，请输入数字。")
+                return
+
+        # 3. 应用反向公式  x = b * (y / (a - y))^(1/n)
+        lines = [f"Hill 参数： a={a:.4g}  b={b:.4g}  n={n:.4g}"]
+        col2 = "反推压力 (N)"
+        lines.append(f"{'ADC 均值':>14}  {col2:>14}  状态")
+        lines.append("-" * 46)
+        results = []  # [(adc, pressure or None)]
+        for y_val in adc_values:
+            if y_val <= 0:
+                lines.append(f"{y_val:>14.4g}  {'---':>14}  ADC 小于等于 0，无意义")
+                results.append((y_val, None))
+            elif y_val >= a:
+                lines.append(f"{y_val:>14.4g}  {'---':>14}  ADC 超过饱和値 a={a:.4g}")
+                results.append((y_val, None))
+            else:
+                x_val = b * (y_val / (a - y_val)) ** (1.0 / n)
+                lines.append(f"{y_val:>14.4g}  {x_val:>14.4f}  ✓")
+                results.append((y_val, x_val))
+
+        # 4. 更新结果文本框
+        self.inv_result_text.config(state="normal")
+        self.inv_result_text.delete("1.0", "end")
+        self.inv_result_text.insert("end", "\n".join(lines))
+        self.inv_result_text.config(state="disabled")
+
+        # 5. 绘制反向曲线图
+        self._plot_inverse(a, b, n, results)
+        self.tab_view.set("反向推算")
+        self._set_status(f"反向推算完成，共 {len(adc_values)} 个 ADC 値")
+
+    def _plot_inverse(self, a: float, b: float, n: float, results: list):
+        """绘制反向曲线图：ADC 均值 → 压力曲线 + 查询点标注。"""
+        fig = self.fig_inverse
+        fig.clear()
+
+        # 生成曲线数据（ADC 从 0.1%a 到 99%a）
+        y_curve = np.linspace(0.001 * a, 0.999 * a, 500)
+        x_curve = b * (y_curve / (a - y_curve)) ** (1.0 / n)
+
+        # 上图：压力（X）→ ADC（Y）正向曲线 + 查询点
+        ax1 = fig.add_subplot(121)
+        ax1.set_facecolor("#0d1b2a")
+        ax1.plot(x_curve, y_curve, color="#00BCD4", lw=2,
+                 label=f"Hill正向曲线\na={a:.3g}, b={b:.3g}, n={n:.3g}")
+        valid = [(y_v, x_v) for y_v, x_v in results if x_v is not None]
+        if valid:
+            ys_q = [v[0] for v in valid]
+            xs_q = [v[1] for v in valid]
+            ax1.scatter(xs_q, ys_q, color="#FF6F00", s=80, zorder=5,
+                        label="查询点")
+            for x_v, y_v in zip(xs_q, ys_q):
+                ax1.annotate(
+                    f"  ({x_v:.2f} N, {y_v:.2f})",
+                    xy=(x_v, y_v), fontsize=7, color="#FFD54F",
+                    xytext=(6, 0), textcoords="offset points",
+                )
+                ax1.axhline(y_v, color="#FF6F00", lw=0.6, ls="--", alpha=0.4)
+                ax1.axvline(x_v, color="#FF6F00", lw=0.6, ls="--", alpha=0.4)
+        self._style_ax(ax1, title="正向曲线：压力 → ADC",
+                       xlabel="压力 (N)", ylabel="ADC 均值")
+        ax1.legend(fontsize=7, facecolor="#16213e", labelcolor="white")
+
+        # 下图：ADC（X）→ 压力（Y）反向曲线 + 查询点
+        ax2 = fig.add_subplot(122)
+        ax2.set_facecolor("#0d1b2a")
+        ax2.plot(y_curve, x_curve, color="#4CAF50", lw=2,
+                 label=f"Hill反向曲线\nx = b·(y/(a−y))^(1/n)")
+        if valid:
+            ax2.scatter(ys_q, xs_q, color="#FF6F00", s=80, zorder=5,
+                        label="查询点")
+            for x_v, y_v in zip(xs_q, ys_q):
+                ax2.annotate(
+                    f"  ({y_v:.2f}, {x_v:.2f} N)",
+                    xy=(y_v, x_v), fontsize=7, color="#FFD54F",
+                    xytext=(6, 0), textcoords="offset points",
+                )
+                ax2.axvline(y_v, color="#FF6F00", lw=0.6, ls="--", alpha=0.4)
+                ax2.axhline(x_v, color="#FF6F00", lw=0.6, ls="--", alpha=0.4)
+        self._style_ax(ax2, title="反向曲线：ADC → 压力",
+                       xlabel="ADC 均值", ylabel="压力 (N)")
+        ax2.legend(fontsize=7, facecolor="#16213e", labelcolor="white")
+
+        fig.suptitle(
+            f"ADC ↔ 压力 双向曲线  |  a={a:.4g}  b={b:.4g}  n={n:.4g}",
+            color="white", fontsize=11, y=0.98,
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        self.canvas_inverse.draw()
+
+    # ── 工具 ───────────────────────────────────────────────────────────────────
     def _set_status(self, msg: str):
         self.status_var.set(msg)
         self.update_idletasks()
