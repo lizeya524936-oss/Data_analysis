@@ -1,5 +1,5 @@
 """
-传感器 Hill 方程拟合分析工具  v1.6
+传感器 Hill 方程拟合分析工具  v1.6.1
 =======================================
 核心分析逻辑（v1.3 重构，v1.4 新增加载参数模式，v1.5 改为单传感器均值）：
   1. 每个 CSV 文件包含同一次实验的 4 个传感器列
@@ -314,9 +314,9 @@ def back_project_to_sum_curves(
 # ─── 主应用 ────────────────────────────────────────────────────────────────────
 
 class SensorAnalyzerApp(ctk.CTk):
-    """传感器 Hill 方程拟合分析工具 v1.6"""
+    """传感器 Hill 方程拟合分析工具 v1.6.1"""
 
-    VERSION = "v1.6"
+    VERSION = "v1.6.1"
 
     def __init__(self):
         super().__init__()
@@ -1416,8 +1416,12 @@ class SensorAnalyzerApp(ctk.CTk):
                 results.append((y_val, None))
             else:
                 x_val = b * (y_val / (a - y_val)) ** (1.0 / n)
-                lines.append(f"{y_val:>14.4g}  {x_val:>14.4f}  ✓")
-                results.append((y_val, x_val))
+                if x_val > 100.0 + 0.01:  # 允许微小浮点误差
+                    lines.append(f"{y_val:>14.4g}  {x_val:>14.4f}  ⚠ 超出 100N 范围")
+                    results.append((y_val, x_val))  # 保留但标记
+                else:
+                    lines.append(f"{y_val:>14.4g}  {x_val:>14.4f}  ✓")
+                    results.append((y_val, x_val))
 
         # 4. 更新结果文本框
         self.inv_result_text.config(state="normal")
@@ -1435,8 +1439,11 @@ class SensorAnalyzerApp(ctk.CTk):
         fig = self.fig_inverse
         fig.clear()
 
-        # 生成曲线数据（ADC 从 0.1%a 到 99%a）
-        y_curve = np.linspace(0.001 * a, 0.999 * a, 500)
+        # 生成曲线数据，压力范围限制在 0-100N
+        P_MAX = 100.0
+        # 计算 100N 对应的 ADC 值作为曲线上界
+        adc_at_pmax = a * P_MAX**n / (b**n + P_MAX**n)
+        y_curve = np.linspace(0.001 * a, min(adc_at_pmax, 0.999 * a), 500)
         x_curve = b * (y_curve / (a - y_curve)) ** (1.0 / n)
 
         # 上图：压力（X）→ ADC（Y）正向曲线 + 查询点
@@ -1458,7 +1465,8 @@ class SensorAnalyzerApp(ctk.CTk):
                 )
                 ax1.axhline(y_v, color="#FF6F00", lw=0.6, ls="--", alpha=0.4)
                 ax1.axvline(x_v, color="#FF6F00", lw=0.6, ls="--", alpha=0.4)
-        self._style_ax(ax1, title="正向曲线：压力 → ADC",
+        ax1.set_xlim(0, P_MAX * 1.05)
+        self._style_ax(ax1, title="正向曲线：压力 → ADC（0–100N）",
                        xlabel="压力 (N)", ylabel="ADC 均值")
         ax1.legend(fontsize=7, facecolor="#16213e", labelcolor="white")
 
@@ -1478,12 +1486,13 @@ class SensorAnalyzerApp(ctk.CTk):
                 )
                 ax2.axvline(y_v, color="#FF6F00", lw=0.6, ls="--", alpha=0.4)
                 ax2.axhline(x_v, color="#FF6F00", lw=0.6, ls="--", alpha=0.4)
-        self._style_ax(ax2, title="反向曲线：ADC → 压力",
+        ax2.set_ylim(0, P_MAX * 1.05)
+        self._style_ax(ax2, title="反向曲线：ADC → 压力（0–100N）",
                        xlabel="ADC 均值", ylabel="压力 (N)")
         ax2.legend(fontsize=7, facecolor="#16213e", labelcolor="white")
 
         fig.suptitle(
-            f"ADC ↔ 压力 双向曲线  |  a={a:.4g}  b={b:.4g}  n={n:.4g}",
+            f"ADC ↔ 压力 双向曲线 (0–100N)  |  a={a:.4g}  b={b:.4g}  n={n:.4g}",
             color="white", fontsize=11, y=0.98,
         )
         fig.tight_layout(rect=[0, 0, 1, 0.96])
