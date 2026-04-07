@@ -1,5 +1,5 @@
 """
-传感器 Hill 方程拟合分析工具  v1.6.1
+传感器 Hill 方程拟合分析工具  v1.7
 =======================================
 核心分析逻辑（v1.3 重构，v1.4 新增加载参数模式，v1.5 改为单传感器均值）：
   1. 每个 CSV 文件包含同一次实验的 4 个传感器列
@@ -259,7 +259,7 @@ def back_project_to_sum_curves(
     filenames: list,
     hill_a, hill_b, hill_n,
     hyp_a=None, hyp_b=None,
-    p_min=0.0, p_max=200.0,
+    p_min=0.0, p_max=100.0,
     smooth_window=5,
 ) -> list:
     results = []
@@ -314,9 +314,9 @@ def back_project_to_sum_curves(
 # ─── 主应用 ────────────────────────────────────────────────────────────────────
 
 class SensorAnalyzerApp(ctk.CTk):
-    """传感器 Hill 方程拟合分析工具 v1.6.1"""
+    """传感器 Hill 方程拟合分析工具 v1.7"""
 
-    VERSION = "v1.6.1"
+    VERSION = "v1.7"
 
     def __init__(self):
         super().__init__()
@@ -396,7 +396,7 @@ class SensorAnalyzerApp(ctk.CTk):
         prow = ctk.CTkFrame(scroll, fg_color="transparent")
         prow.pack(fill="x", pady=(0, 6))
         self.p_min_var = tk.DoubleVar(value=0.0)
-        self.p_max_var = tk.DoubleVar(value=200.0)
+        self.p_max_var = tk.DoubleVar(value=100.0)
         ctk.CTkEntry(prow, textvariable=self.p_min_var, width=80,
                      placeholder_text="最小").pack(side="left", padx=(0, 4))
         ctk.CTkLabel(prow, text="~", font=FONT_LABEL).pack(side="left", padx=2)
