@@ -1,5 +1,5 @@
 """
-传感器 Hill 方程拟合分析工具  v1.7
+传感器 Hill 方程拟合分析工具  v1.8
 =======================================
 核心分析逻辑（v1.3 重构，v1.4 新增加载参数模式，v1.5 改为单传感器均值）：
   1. 每个 CSV 文件包含同一次实验的 4 个传感器列
@@ -311,6 +311,103 @@ def back_project_to_sum_curves(
         results.append(entry)
     return results
 
+# ─── 一致性评估（维度三 + 维度五）─────────────────────────────────────────────
+
+KEY_PRESSURES = [5, 10, 20, 30, 50, 70, 100]
+
+def fit_hill_individual(sum_curves, filenames, p_min, p_max, smooth_window=5):
+    """对每次实验独立拟合 Hill 参数，返回 individual 列表"""
+    individual = []
+    for curve, fname in zip(sum_curves, filenames):
+        if len(curve) < 4:
+            continue
+        pts = sorted(curve, key=lambda x: x["pressure"])
+        pressures = np.array([pt["pressure"] for pt in pts])
+        values    = np.array([pt["sum_value"]  for pt in pts])
+        p_range   = pressures[-1] - pressures[0]
+        bin_width = max(0.5, min(1.0, p_range / (len(pts) / 5)))
+        bin_count = int(np.ceil(p_range / bin_width))
+        bin_edges = np.linspace(pressures[0], pressures[-1], bin_count + 1)
+        bp_list, bv_list = [], []
+        for i in range(bin_count):
+            mask = (pressures >= bin_edges[i]) & (pressures < bin_edges[i + 1])
+            if mask.sum() == 0:
+                continue
+            bp_list.append(float(np.mean(pressures[mask])))
+            bv_list.append(float(np.mean(values[mask])))
+        bp_arr = np.array(bp_list)
+        bv_arr = np.array(bv_list)
+        half   = smooth_window // 2
+        sv = np.convolve(bv_arr, np.ones(smooth_window) / smooth_window, mode="same")
+        for i in range(half):
+            w = i + 1
+            sv[i]      = np.mean(bv_arr[:w * 2 + 1])
+            sv[-(i+1)] = np.mean(bv_arr[-(w * 2 + 1):])
+        a, b, n, rmse, r2, resid = fit_hill(bp_arr, sv)
+        individual.append({
+            "filename": fname,
+            "pressures": bp_arr,
+            "values": sv,
+            "fit": {"a": a, "b": b, "n": n, "rmse": rmse, "r2": r2,
+                    "residuals": np.array(resid)},
+        })
+    return individual
+
+
+def calc_key_point_consistency(individual, mean_a, mean_b, mean_n):
+    """维度三：关键压力点一致性"""
+    fs_adc = max(hill_func(100, mean_a, mean_b, mean_n), 1.0)
+    result = {}
+    for kp in KEY_PRESSURES:
+        vals = [hill_func(kp, ind["fit"]["a"], ind["fit"]["b"], ind["fit"]["n"])
+                for ind in individual]
+        mean_val = np.mean(vals)
+        std_val  = np.std(vals, ddof=1) if len(vals) > 1 else 0
+        cv_val   = std_val / mean_val * 100 if mean_val > 0 else 0
+        max_spread = max(vals) - min(vals)
+        max_spread_pct = max_spread / fs_adc * 100
+        result[kp] = {
+            "values": vals, "mean": mean_val, "std": std_val,
+            "cv": cv_val, "max_spread": max_spread,
+            "max_spread_pct_fs": max_spread_pct,
+        }
+    avg_cv = np.mean([v["cv"] for v in result.values()])
+    if avg_cv <= 3: score = 100
+    elif avg_cv >= 20: score = 0
+    else: score = max(0, 100 - (avg_cv - 3) / 17 * 100)
+    return result, avg_cv, score
+
+
+def calc_residual_distribution(individual, back_projections):
+    """维度五：残差分布一致性"""
+    all_residuals = []
+    per_exp_stats = []
+    for bp in back_projections:
+        res = np.array(bp["hill_residuals"])
+        all_residuals.extend(res.tolist())
+        res_std = np.std(res)
+        per_exp_stats.append({
+            "filename": bp["filename"],
+            "mean": float(np.mean(res)),
+            "std": float(res_std),
+            "max_abs": float(np.max(np.abs(res))),
+            "skewness": float(np.mean(((res - np.mean(res)) / (res_std + 1e-12))**3)),
+        })
+    all_res = np.array(all_residuals)
+    overall_mean = float(np.mean(all_res))
+    overall_std  = float(np.std(all_res))
+    if overall_std <= 5: score = 100
+    elif overall_std >= 30: score = 0
+    else: score = max(0, 100 - (overall_std - 5) / 25 * 100)
+    return {
+        "per_exp_stats": per_exp_stats,
+        "all_residuals": all_res,
+        "overall_mean": overall_mean,
+        "overall_std": overall_std,
+        "score": score,
+    }
+
+
 # ─── 主应用 ────────────────────────────────────────────────────────────────────
 
 class SensorAnalyzerApp(ctk.CTk):
@@ -329,6 +426,7 @@ class SensorAnalyzerApp(ctk.CTk):
         self.loaded_files: list[dict] = []
         self.analysis_result: Optional[dict] = None
         self.loaded_param_result: Optional[dict] = None  # 加载参数模式结果
+        self.consistency_result: Optional[dict] = None     # 一致性评估结果 v1.8
 
         self._build_ui()
 
@@ -607,11 +705,13 @@ class SensorAnalyzerApp(ctk.CTk):
         self.tab_each   = self.tab_view.add("各次实验对比")
         self.tab_loaded  = self.tab_view.add("加载参数残差")   # v1.4 新增
         self.tab_inverse = self.tab_view.add("反向推算")           # v1.6 新增
+        self.tab_consist = self.tab_view.add("一致性评估")         # v1.8 新增
         self.fig_fit,     self.canvas_fit     = self._make_canvas(self.tab_fit)
         self.fig_resid,   self.canvas_resid   = self._make_canvas(self.tab_resid)
         self.fig_each,    self.canvas_each    = self._make_canvas(self.tab_each)
         self.fig_loaded,  self.canvas_loaded  = self._make_canvas(self.tab_loaded)
         self.fig_inverse, self.canvas_inverse = self._make_canvas(self.tab_inverse)
+        self.fig_consist, self.canvas_consist = self._make_canvas(self.tab_consist)
 
     def _make_canvas(self, parent):
         fig = Figure(figsize=(10, 7), dpi=96, facecolor="#0d1b2a")
@@ -946,15 +1046,38 @@ class SensorAnalyzerApp(ctk.CTk):
             "backProjections": back_projections,
         }
 
+        # ── 一致性评估（维度三 + 维度五）v1.8 ──
+        if len(sum_curves) >= 2:
+            individual = fit_hill_individual(
+                sum_curves, filenames, p_min, p_max, smooth_w)
+            kp_result, kp_avg_cv, kp_score = calc_key_point_consistency(
+                individual, hill_a, hill_b, hill_n)
+            resid_result = calc_residual_distribution(
+                individual, back_projections)
+            self.consistency_result = {
+                "individual": individual,
+                "key_point": kp_result,
+                "kp_avg_cv": kp_avg_cv,
+                "kp_score": kp_score,
+                "residual": resid_result,
+            }
+        else:
+            self.consistency_result = None
+
         self._update_params_text()
         self._plot_fit_curve()
         self._plot_residuals()
         self._plot_each_experiment()
+        if self.consistency_result:
+            self._plot_consistency()
 
         outlier_tag = f"（已剪除±{outlier_thresh:.0f}%离群点）" if remove_outliers else ""
+        consist_tag = ""
+        if self.consistency_result:
+            consist_tag = f"，关键点平均CV={self.consistency_result['kp_avg_cv']:.1f}%"
         self._set_status(
             f"分析完成：{len(sum_curves)} 次实验{outlier_tag}，"
-            f"Hill R²={hill_r2:.4f}，双曲线 R²={hyp_r2:.4f}"
+            f"Hill R²={hill_r2:.4f}，双曲线 R²={hyp_r2:.4f}{consist_tag}"
         )
 
     # ── 参数文本 ───────────────────────────────────────────────────────────────
@@ -1008,6 +1131,34 @@ class SensorAnalyzerApp(ctk.CTk):
                 lines.append(
                     f"  {Path(bp['filename']).stem[:18]}"
                     f"  RMSE={bp['hill_rmse']:.3f}  R²={bp['hill_r2']:.4f}"
+                )
+
+        if self.consistency_result:
+            cr = self.consistency_result
+            kp = cr["key_point"]
+            rd = cr["residual"]
+            lines += [
+                "",
+                "═══ 一致性评估 ═══",
+                f"关键压力点平均CV: {cr['kp_avg_cv']:.1f}%  评分: {cr['kp_score']:.0f}/100",
+                f"残差分布σ: {rd['overall_std']:.2f}  评分: {rd['score']:.0f}/100",
+                "─" * 34,
+                "关键压力点CV详情:",
+            ]
+            for p_val in KEY_PRESSURES:
+                info = kp[p_val]
+                lines.append(
+                    f"  {p_val:3d}N: 均值={info['mean']:.1f}  "
+                    f"CV={info['cv']:.1f}%  极差={info['max_spread']:.1f}"
+                )
+            lines += [
+                "─" * 34,
+                "各次实验残差统计:",
+            ]
+            for st in rd["per_exp_stats"]:
+                lines.append(
+                    f"  {Path(st['filename']).stem[:18]}"
+                    f"  μ={st['mean']:.2f}  σ={st['std']:.2f}  max={st['max_abs']:.2f}"
                 )
 
         if not lines:
@@ -1497,8 +1648,108 @@ class SensorAnalyzerApp(ctk.CTk):
         )
         fig.tight_layout(rect=[0, 0, 1, 0.96])
         self.canvas_inverse.draw()
+    # ── 一致性评估图表 v1.8 ─────────────────────────────────────────────────────
 
-    # ── 工具 ───────────────────────────────────────────────────────────────────
+    def _plot_consistency(self):
+        cr = self.consistency_result
+        if not cr:
+            return
+        kp_data = cr["key_point"]
+        rd_data = cr["residual"]
+        individual = cr["individual"]
+        filenames = [ind["filename"] for ind in individual]
+        short_names = [Path(f).stem[:15] for f in filenames]
+        n_exp = len(individual)
+
+        fig = self.fig_consist
+        fig.clear()
+        fig.patch.set_facecolor("#0d1b2a")
+
+        # 布局：2行2列
+        gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.30,
+                              left=0.08, right=0.95, top=0.92, bottom=0.08)
+
+        # ── 左上：关键压力点 CV 折线图 ──
+        ax1 = fig.add_subplot(gs[0, 0])
+        pressures = KEY_PRESSURES
+        cvs = [kp_data[p]["cv"] for p in pressures]
+        ax1.plot(pressures, cvs, "o-", color="#4FC3F7", lw=2, ms=8,
+                 label="CV (%)")
+        ax1.axhline(5, color="#4CAF50", ls="--", lw=1, alpha=0.7, label="优秀 (5%)")
+        ax1.axhline(10, color="#FFB74D", ls="--", lw=1, alpha=0.7, label="合格 (10%)")
+        ax1.axhline(15, color="#F06292", ls="--", lw=1, alpha=0.7, label="警告 (15%)")
+        for p_val, cv_val in zip(pressures, cvs):
+            ax1.annotate(f"{cv_val:.1f}%", xy=(p_val, cv_val),
+                         xytext=(0, 10), textcoords="offset points",
+                         fontsize=8, color="#E0E0E0", ha="center")
+        self._style_ax(ax1, title="维度三：关键压力点一致性 (CV)",
+                       xlabel="压力 (N)", ylabel="变异系数 CV (%)")
+        ax1.legend(fontsize=7, facecolor="#16213e", labelcolor="white", loc="upper right")
+
+        # ── 右上：各次实验在关键压力点的预测值散点 ──
+        ax2 = fig.add_subplot(gs[0, 1])
+        for i, ind in enumerate(individual):
+            vals = [hill_func(p, ind["fit"]["a"], ind["fit"]["b"], ind["fit"]["n"])
+                    for p in pressures]
+            color = COLORS_EXP[i % len(COLORS_EXP)]
+            ax2.plot(pressures, vals, "o-", color=color, lw=1.5, ms=6,
+                     alpha=0.8, label=short_names[i])
+        # 均值线
+        mean_vals = [kp_data[p]["mean"] for p in pressures]
+        ax2.plot(pressures, mean_vals, "s--", color="#FFFFFF", lw=2, ms=7,
+                 label="均值", zorder=10)
+        self._style_ax(ax2, title="各次实验在关键压力点的预测值",
+                       xlabel="压力 (N)", ylabel="ADC 预测值")
+        ax2.legend(fontsize=6, facecolor="#16213e", labelcolor="white",
+                   loc="upper left", ncol=2)
+
+        # ── 左下：残差分布直方图 ──
+        ax3 = fig.add_subplot(gs[1, 0])
+        all_res = rd_data["all_residuals"]
+        ax3.hist(all_res, bins=30, color="#FFB74D", alpha=0.8, edgecolor="#333")
+        ax3.axvline(0, color="#FFFFFF", ls="-", lw=1)
+        overall_std = rd_data["overall_std"]
+        overall_mean = rd_data["overall_mean"]
+        ax3.axvline(overall_mean, color="#4FC3F7", ls="--", lw=1.5,
+                    label=f"均值={overall_mean:.2f}")
+        ax3.axvline(overall_mean + overall_std, color="#F06292", ls=":", lw=1,
+                    label=f"±σ={overall_std:.2f}")
+        ax3.axvline(overall_mean - overall_std, color="#F06292", ls=":", lw=1)
+        self._style_ax(ax3, title=f"维度五：残差分布 (σ={overall_std:.2f}, 评分={rd_data['score']:.0f})",
+                       xlabel="残差 (ADC)", ylabel="频次")
+        ax3.legend(fontsize=7, facecolor="#16213e", labelcolor="white")
+
+        # ── 右下：各次实验残差统计柱状图 ──
+        ax4 = fig.add_subplot(gs[1, 1])
+        stats = rd_data["per_exp_stats"]
+        x_pos = np.arange(len(stats))
+        stds = [s["std"] for s in stats]
+        max_abs = [s["max_abs"] for s in stats]
+        bar_w = 0.35
+        bars1 = ax4.bar(x_pos - bar_w/2, stds, bar_w, color="#4FC3F7",
+                        label="σ (标准差)", alpha=0.85)
+        bars2 = ax4.bar(x_pos + bar_w/2, max_abs, bar_w, color="#F06292",
+                        label="max|res|", alpha=0.85)
+        for bar, val in zip(bars1, stds):
+            ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                     f"{val:.1f}", ha="center", fontsize=7, color="#E0E0E0")
+        for bar, val in zip(bars2, max_abs):
+            ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.3,
+                     f"{val:.1f}", ha="center", fontsize=7, color="#E0E0E0")
+        ax4.set_xticks(x_pos)
+        ax4.set_xticklabels(short_names, rotation=30, ha="right", fontsize=7)
+        self._style_ax(ax4, title="各次实验残差统计对比",
+                       xlabel="实验", ylabel="ADC")
+        ax4.legend(fontsize=7, facecolor="#16213e", labelcolor="white")
+
+        fig.suptitle(
+            f"一致性评估  |  关键点平均CV={cr['kp_avg_cv']:.1f}% (评分{cr['kp_score']:.0f})  |  "
+            f"残差σ={rd_data['overall_std']:.2f} (评分{rd_data['score']:.0f})",
+            color="white", fontsize=11, y=0.98,
+        )
+        self.canvas_consist.draw()
+
+    # ── 工具 ───────────────────────────────────────────────────────────────────────
     def _set_status(self, msg: str):
         self.status_var.set(msg)
         self.update_idletasks()
