@@ -373,8 +373,8 @@ def calc_key_point_consistency(individual, mean_a, mean_b, mean_n):
         }
     avg_cv = np.mean([v["cv"] for v in result.values()])
     if avg_cv <= 3: score = 100
-    elif avg_cv >= 20: score = 0
-    else: score = max(0, 100 - (avg_cv - 3) / 17 * 100)
+    elif avg_cv >= 8: score = 0
+    else: score = max(0, 100 - (avg_cv - 3) / 5 * 100)
     return result, avg_cv, score
 
 
@@ -1675,9 +1675,9 @@ class SensorAnalyzerApp(ctk.CTk):
         cvs = [kp_data[p]["cv"] for p in pressures]
         ax1.plot(pressures, cvs, "o-", color="#4FC3F7", lw=2, ms=8,
                  label="CV (%)")
-        ax1.axhline(5, color="#4CAF50", ls="--", lw=1, alpha=0.7, label="优秀 (5%)")
-        ax1.axhline(10, color="#FFB74D", ls="--", lw=1, alpha=0.7, label="合格 (10%)")
-        ax1.axhline(15, color="#F06292", ls="--", lw=1, alpha=0.7, label="警告 (15%)")
+        ax1.axhline(3, color="#4CAF50", ls="--", lw=1, alpha=0.7, label="优秀 (3%)")
+        ax1.axhline(5, color="#FFB74D", ls="--", lw=1, alpha=0.7, label="合格 (5%)")
+        ax1.axhline(8, color="#F06292", ls="--", lw=1, alpha=0.7, label="警告 (8%)")
         for p_val, cv_val in zip(pressures, cvs):
             ax1.annotate(f"{cv_val:.1f}%", xy=(p_val, cv_val),
                          xytext=(0, 10), textcoords="offset points",
